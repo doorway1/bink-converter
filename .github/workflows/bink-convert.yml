@@ -1,227 +1,229 @@
-name: bink-convert
 
-# Convert MP4 to Bink 1 (.bik) using Wine on a Linux runner.
-# Wine + Xvfb gives the radvideo64.exe GUI app a virtual display,
-# letting it run headlessly in CI.
-#
-# Cost: free on public repo (unlimited Linux runner minutes)
-# Cold start: ~3-5 min (Wine install + Xvfb + extract)
-# Warm start: ~1-2 min (cache hit)
-# Per-conversion: 10s-2min depending on MP4 length
+name: bink-convert
 
 on:
   workflow_dispatch:
     inputs:
       input_url:
-        description: "URL to the input MP4 (http/https)"
+        description: "Direct download URL for your MP4"
         required: true
         type: string
-        default: "https://github.com/hoangnb24/bink-converter/raw/main/test-fixtures/sample.mp4"
       output_name:
-        description: "Output filename (without .bik extension)"
+        description: "Output filename without extension"
         required: true
         type: string
         default: "output"
-      video_bitrate:
-        description: "Video bitrate in kbps (200-5000)"
-        required: false
-        type: string
-        default: "1000"
-      audio_bitrate:
-        description: "Audio bitrate in kbps (0 = no audio)"
-        required: false
-        type: string
-        default: "128"
-      format:
-        description: "Bink version (1 = .bik, 2 = .bk2)"
-        required: false
-        type: string
-        default: "1"
 
 jobs:
   convert:
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Wine and Xvfb
+      - name: Install dependencies
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            wine \
-            wine64 \
-            xvfb \
-            p7zip-full \
-            cabextract
-          # Ubuntu's wine package installs binaries at /usr/bin/wine (a wrapper
-          # script) and /usr/lib/wine/wine64. The wrapper calls wine-stable or
-          # wine-staging. Make sure wine64 is resolvable.
-          which wine wine64 2>&1 || true
-          ls /usr/bin/wine* 2>&1 || true
-          ls /usr/lib/wine/ 2>&1 || true
+            wine wine64 xvfb p7zip-full cabextract file
 
-      - name: Cache RAD Tools extraction
+      - name: Cache RAD Tools
+        id: cache
         uses: actions/cache@v4
         with:
           path: radtools-cache
-          key: radtools-v2-${{ hashFiles('.github/radtools-checksum.txt') }}
-          restore-keys: |
-            radtools-v2-
+          key: radtools-ubuntu22-dace86bb00b755fea8a0002538fad79e3faebdd6
 
-      - name: Download and extract RAD Video Tools
+      - name: Download and verify RAD Tools
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          echo "Downloading RADTools.7z..."
-          curl -fsL -o RADTools.7z "https://www.radgametools.com/down/Bink/RADTools.7z"
-          echo "Verifying SHA1..."
-          echo "d405195191ba984a4f87e6bce0b19cee2b9b0a3d  RADTools.7z" | sha1sum -c -
-          echo "Extracting with 7z (password: RAD)..."
-          7z x RADTools.7z -pRAD -y >/dev/null
-          mkdir -p radtools-cache
-          7z e radtools.exe -oradtools-cache -y >/dev/null
-          sha1sum RADTools.7z | cut -d' ' -f1 > .github/radtools-checksum.txt
-          echo "Extraction complete:"
-          ls -la radtools-cache/
+          set -euo pipefail
 
-      - name: Patch PE subsystem byte (GUI → Console)
-        run: |
-          # radvideo64.exe is a Windows GUI app. Patch the PE subsystem
-          # byte from 0x02 (Windows GUI) to 0x03 (Windows Console) so
-          # the loader doesn't try to spin up the full GUI subsystem.
-          # The actual code paths still work; they just won't try to
-          # create a window.
-          python3 << 'EOF'
-          import struct
-          with open("radtools-cache/radvideo64.exe", "rb") as f:
-              data = f.read()
-          e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
-          subsystem_offset = e_lfanew + 92
-          original = data[subsystem_offset]
-          print(f"  PE offset: 0x{e_lfanew:X}")
-          print(f"  Subsystem offset: 0x{subsystem_offset:X}")
-          print(f"  Original subsystem: {original} (2=GUI, 3=Console)")
-          if original != 2:
-              print(f"  Already patched or unexpected value, skipping")
-          else:
-              patched = bytearray(data)
-              patched[subsystem_offset] = 3
-              with open("radtools-cache/radvideo64.exe", "wb") as f:
-                  f.write(patched)
-              print(f"  Patched to: 3 (Console)")
-          EOF
+          mkdir -p RAD-extract radtools-cache
 
-      - name: Initialize Wine prefix under Xvfb
-        run: |
-          # Wine needs a display to even initialize a prefix. Xvfb
-          # (X virtual framebuffer) gives it one without a real monitor.
-          echo "Starting Xvfb on :99..."
-          Xvfb :99 -screen 0 1024x768x24 &
-          XVFB_PID=$!
-          sleep 2
+          curl -fL --retry 3 \
+            -o RADTools.7z \
+            "https://www.radgametools.com/down/Bink/RADTools.7z"
 
-          echo "Initializing Wine prefix..."
-          export DISPLAY=:99
-          export WINEPREFIX=$HOME/.wine
-          export WINEDEBUG=-all
-          export WINEARCH=win64
-          # Use wine (the wrapper) - it dispatches to wine64 internally
-          timeout 60 wine wineboot --init 2>&1 | tail -3
+          echo "Verifying official RAD archive checksum..."
+          echo "dace86bb00b755fea8a0002538fad79e3faebdd6  RADTools.7z" | sha1sum -c -
 
-          echo "Wine prefix initialized:"
-          ls $WINEPREFIX/drive_c/windows/system32/notepad.exe 2>&1
-          ls $WINEPREFIX/drive_c/windows/ 2>&1 | head -5
+          echo "Extracting RAD archive..."
+          7z x RADTools.7z -pRAD -y -oRAD-extract
 
-          # Stash the env so subsequent steps inherit it
-          echo "DISPLAY=:99" >> $GITHUB_ENV
-          echo "WINEPREFIX=$HOME/.wine" >> $GITHUB_ENV
-          echo "WINEDEBUG=-all" >> $GITHUB_ENV
-          echo "WINEARCH=win64" >> $GITHUB_ENV
-          echo "XVFB_PID=$XVFB_PID" >> $GITHUB_ENV
+          RAD_INSTALLER=$(find RAD-extract -type f -iname 'radtools.exe' -print -quit)
 
-      - name: Download input MP4
-        env:
-          DISPLAY: :99
-          WINEPREFIX: ${{ env.WINEPREFIX }}
-        run: |
-          echo "Downloading ${{ inputs.input_url }}..."
-          curl -fsL -o input.mp4 "${{ inputs.input_url }}"
-          ls -lah input.mp4
-          if [ $(stat -c %s input.mp4) -lt 1000 ]; then
-            echo "Error: file too small, likely not a real MP4"
+          if [ -z "$RAD_INSTALLER" ]; then
+            echo "Could not find RADTools.exe in downloaded archive."
+            find RAD-extract -maxdepth 3 -type f
             exit 1
           fi
 
-      - name: Copy MP4 into Wine prefix
+          echo "Extracting RAD installer..."
+          7z x "$RAD_INSTALLER" -y -oradtools-cache
+
+          RAD_EXE=$(find radtools-cache -type f -iname 'radvideo64.exe' -print -quit)
+
+          if [ -z "$RAD_EXE" ]; then
+            echo "Could not find radvideo64.exe."
+            find radtools-cache -maxdepth 4 -type f
+            exit 1
+          fi
+
+          if [ "$RAD_EXE" != "radtools-cache/radvideo64.exe" ]; then
+            cp "$RAD_EXE" radtools-cache/radvideo64.exe
+          fi
+
+          echo "RAD tools extracted successfully."
+          ls -lh radtools-cache/radvideo64.exe
+
+      - name: Validate output name
+        env:
+          OUTPUT_NAME: ${{ inputs.output_name }}
+        run: |
+          if ! [[ "$OUTPUT_NAME" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "Use only letters, numbers, underscores and hyphens in the output name."
+            exit 1
+          fi
+
+      - name: Start virtual display and initialize Wine
+        run: |
+          set -euo pipefail
+
+          Xvfb :99 -screen 0 1024x768x24 &
+          sleep 2
+
+          export DISPLAY=:99
+          export WINEPREFIX="$HOME/.wine"
+          export WINEARCH=win64
+          export WINEDEBUG=-all
+
+          wineboot --init
+
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          echo "WINEPREFIX=$HOME/.wine" >> "$GITHUB_ENV"
+          echo "WINEARCH=win64" >> "$GITHUB_ENV"
+          echo "WINEDEBUG=-all" >> "$GITHUB_ENV"
+
+      - name: Download MP4
+        env:
+          INPUT_URL: ${{ inputs.input_url }}
+        run: |
+          set -euo pipefail
+
+          curl -fL --retry 3 \
+            --output input.mp4 \
+            "$INPUT_URL"
+
+          echo "Downloaded file:"
+          ls -lh input.mp4
+          file input.mp4
+
+          python3 - <<'PY'
+          import sys
+
+          with open("input.mp4", "rb") as f:
+              header = f.read(12)
+
+          if len(header) < 8 or header[4:8] != b"ftyp":
+              print("Error: downloaded file does not have an MP4 ftyp header.")
+              sys.exit(1)
+
+          print("MP4 container header verified.")
+          PY
+
+      - name: Copy files into Wine prefix
         env:
           WINEPREFIX: ${{ env.WINEPREFIX }}
         run: |
-          cp input.mp4 $WINEPREFIX/drive_c/input.mp4
-          ls -lah $WINEPREFIX/drive_c/input.mp4
+          set -euo pipefail
 
-      - name: Copy RAD Tools binary into Wine prefix
-        env:
-          WINEPREFIX: ${{ env.WINEPREFIX }}
-        run: |
-          # The cache lives at the GHA worktree root, but Wine resolves
-          # paths relative to its drive mapping. Copy the binary into
-          # the prefix's C: drive so Wine can find it.
-          mkdir -p $WINEPREFIX/drive_c/radtools
-          cp radtools-cache/radvideo64.exe $WINEPREFIX/drive_c/radtools/
-          ls -lah $WINEPREFIX/drive_c/radtools/
+          mkdir -p "$WINEPREFIX/drive_c/radtools"
 
-      - name: Run RAD Video Tools encoder under Wine
+          cp input.mp4 "$WINEPREFIX/drive_c/input.mp4"
+          cp radtools-cache/radvideo64.exe "$WINEPREFIX/drive_c/radtools/"
+
+      - name: Show RAD compressor help
         env:
           DISPLAY: :99
           WINEPREFIX: ${{ env.WINEPREFIX }}
           WINEDEBUG: -all
-          WINEARCH: win64
         run: |
-          cd $WINEPREFIX/drive_c
-          echo "Running radvideo64.exe under Wine + Xvfb..."
-          start=$(date +%s)
-          # Use Windows-style path (Z:\ or C:\) so Wine resolves it correctly
+          echo "Checking that RAD Video Tools starts..."
+          cd "$WINEPREFIX/drive_c"
+
+          timeout 30 wine radtools/radvideo64.exe binkc || true
+
+      - name: Encode Bink 1
+        env:
+          DISPLAY: :99
+          WINEPREFIX: ${{ env.WINEPREFIX }}
+          WINEDEBUG: -all
+          OUTPUT_NAME: ${{ inputs.output_name }}
+        run: |
+          set -uo pipefail
+
+          cd "$WINEPREFIX/drive_c"
+
+          echo "Starting Bink 1 compression..."
+
           timeout 300 wine radtools/radvideo64.exe \
+            binkc \
             input.mp4 \
-            /bink /bink${{ inputs.format }} \
-            /bv${{ inputs.video_bitrate }} \
-            /ba${{ inputs.audio_bitrate }} \
-            ${{ inputs.output_name }}.bik
-          exit_code=$?
-          end=$(date +%s)
-          echo "Exit code: $exit_code"
-          echo "Elapsed: $((end - start)) seconds"
-          if [ $exit_code -ne 0 ]; then
-            echo "Warning: radvideo64.exe returned $exit_code, but checking if file was created anyway"
-          fi
-          if [ ! -f "${{ inputs.output_name }}.bik" ]; then
-            echo "Error: output file not created"
-            ls -la $WINEPREFIX/drive_c/
+            "${OUTPUT_NAME}.bik" \
+            /Bink1 \
+            /AutoClose
+
+          if [ ! -s "${OUTPUT_NAME}.bik" ]; then
+            echo "Encoding failed: output file was not created."
+            ls -lah
             exit 1
           fi
-          echo "Output: ${{ inputs.output_name }}.bik"
-          ls -lah ${{ inputs.output_name }}.bik
 
-      - name: Verify .bik file signature
+          echo "Output file created:"
+          ls -lh "${OUTPUT_NAME}.bik"
+
+      - name: Verify Bink 1 output
+        env:
+          WINEPREFIX: ${{ env.WINEPREFIX }}
+          OUTPUT_NAME: ${{ inputs.output_name }}
         run: |
-          # Bink 1 files start with signature BIKf, BIKg, BIKh, or BIKi
-          sig=$(head -c 4 ${{ env.WINEPREFIX }}/drive_c/${{ inputs.output_name }}.bik)
-          echo "First 4 bytes: $sig"
-          case "$sig" in
-            BIKf|BIKg|BIKh|BIKi) echo "Valid Bink signature" ;;
-            *) echo "Invalid Bink signature"; exit 1 ;;
-          esac
+          set -euo pipefail
 
-      - name: Copy .bik out of Wine prefix
+          OUTPUT="$WINEPREFIX/drive_c/${OUTPUT_NAME}.bik"
+
+          python3 - "$OUTPUT" <<'PY'
+          import sys
+
+          path = sys.argv[1]
+
+          with open(path, "rb") as f:
+              signature = f.read(4)
+
+          print("Bink signature:", signature)
+
+          if signature not in (b"BIKf", b"BIKg", b"BIKh", b"BIKi"):
+              print("Error: file does not have a recognized Bink 1 signature.")
+              sys.exit(1)
+
+          print("Bink 1 signature verified.")
+          PY
+
+      - name: Prepare artifact
+        env:
+          WINEPREFIX: ${{ env.WINEPREFIX }}
+          OUTPUT_NAME: ${{ inputs.output_name }}
         run: |
-          cp ${{ env.WINEPREFIX }}/drive_c/${{ inputs.output_name }}.bik ./${{ inputs.output_name }}.bik
-          ls -lah ${{ inputs.output_name }}.bik
-          file ${{ inputs.output_name }}.bik
+          set -euo pipefail
 
-      - name: Upload .bik as artifact
+          cp "$WINEPREFIX/drive_c/${OUTPUT_NAME}.bik" "./${OUTPUT_NAME}.bik"
+          ls -lh "${OUTPUT_NAME}.bik"
+          file "${OUTPUT_NAME}.bik"
+
+      - name: Upload Bink file
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.output_name }}.bik
